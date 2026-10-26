@@ -5,8 +5,8 @@ import asyncio, asyncssh, os, random, re, time
 PORT = 1111
 W, H = 60, 20            # arena size (including border)
 TICK = 0.08              # seconds per frame
-RESPAWN_DELAY = 10
-SHIELD_TIME = 3
+RESPAWN_DELAY = 5
+SHIELD_TIME = 5
 SHOT_COOLDOWN = 0.3
 BULLET_SPEED = 2         # cells per tick
 HKEY = "ssh_host_key"
