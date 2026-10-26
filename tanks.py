@@ -9,7 +9,7 @@ Architecture
   Session     - one connected player: input loop, diff-based rendering, backpressure.
   TankServer  - SSH front end: connection limits, game loop at a fixed timestep.
 
-Run:   pip install asyncssh && python3 tanks.py --port 1111
+Run:   pip install asyncssh && python3 tanks.py --port 1111 [--public-host YOUR.PUBLIC.IP]
 Join:  ssh -p 1111 <host>          (optional password: export TANKS_PASSWORD=...)
 """
 from __future__ import annotations
@@ -22,6 +22,7 @@ import os
 import random
 import re
 import signal
+import socket
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -41,7 +42,7 @@ class _Never(Exception):
 
 TerminalSizeChanged = getattr(asyncssh, "TerminalSizeChanged", _Never)
 
-HUD_ROWS = 3
+HUD_ROWS = 4
 ENTER = "\x1b[?1049h\x1b[2J\x1b[?25l"      # alt screen, clear, hide cursor
 LEAVE = "\x1b[?25h\x1b[?1049l"             # show cursor, leave alt screen
 BACKLOG_LIMIT = 64 * 1024                  # skip frames for clients this far behind
@@ -72,6 +73,7 @@ class Config:
     input_burst: int = 20
     host_key: str = "ssh_host_key"
     password: Optional[str] = None
+    advertise: List[str] = field(default_factory=list)   # addresses shown to players
 
 
 POWERUPS = {
@@ -83,6 +85,33 @@ POWERUPS = {
 }
 
 MOVES = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
+
+
+# --------------------------------------------------------------------------- addresses
+def detect_addresses() -> List[str]:
+    """Best-effort list of this machine's non-loopback IPv4 addresses (LAN first)."""
+    found: List[str] = []
+    try:                                  # UDP connect sends no packets; just picks the route
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            found.append(s.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.append(info[4][0])
+    except OSError:
+        pass
+    out: List[str] = []
+    for ip in found:
+        if ip not in out and not ip.startswith("127.") and not ip.startswith("0."):
+            out.append(ip)
+    return out
+
+
+def connect_hint(cfg: "Config") -> str:
+    hosts = cfg.advertise[:2] or ["<server-ip>"]
+    return " or ".join(f"ssh -p {cfg.port} {h}" for h in hosts)
 
 
 # --------------------------------------------------------------------------- input
@@ -424,6 +453,7 @@ class Game:
         rows.append(f"Top: {board}\x1b[K")
         rows.append("Arrows/WASD move  Space shoot  Q quit | "
                     "T=triple R=rapid P=pierce M=twin S=speed\x1b[K")
+        rows.append(f"Invite friends: {connect_hint(self.cfg)}\x1b[K")
         return rows
 
 
@@ -629,6 +659,10 @@ async def serve(cfg: Config) -> None:
         compression_algs=None, reuse_address=True)
     log.info("tanks listening on port %d (auth: %s)", cfg.port,
              "password" if cfg.password else "open")
+    banner = ["=" * 56, " Tanks server is up. Players can join with:"]
+    banner += [f"     ssh -p {cfg.port} {h}" for h in (cfg.advertise or ["<server-ip>"])]
+    banner += ["     (same machine: ssh -p %d localhost)" % cfg.port, "=" * 56]
+    print("\n".join(banner), flush=True)
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -655,6 +689,9 @@ def main() -> None:
     ap.add_argument("--max-players", type=int, default=30)
     ap.add_argument("--max-per-ip", type=int, default=4)
     ap.add_argument("--host-key", default="ssh_host_key")
+    ap.add_argument("--public-host", action="append", default=[],
+                    help="address/hostname to show players (repeatable); "
+                         "use this for your public IP or DNS name")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -662,6 +699,12 @@ def main() -> None:
     cfg = Config(host=a.host, port=a.port, max_players=a.max_players,
                  max_per_ip=a.max_per_ip, host_key=a.host_key,
                  password=os.environ.get("TANKS_PASSWORD") or None)
+    if a.public_host:
+        cfg.advertise = a.public_host
+    elif a.host and a.host not in ("0.0.0.0", "::"):
+        cfg.advertise = [a.host]
+    else:
+        cfg.advertise = detect_addresses()
     try:
         asyncio.run(serve(cfg))
     except KeyboardInterrupt:
