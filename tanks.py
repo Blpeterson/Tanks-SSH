@@ -2,6 +2,10 @@
 """
 ASCII multiplayer tanks over SSH.
 
+Round flow: the first player in is the admin and edits the map (arrows/WASD move the
+'#' cursor, Space toggles a wall, Enter starts). Others wait in a lobby. After a 3-2-1
+countdown, last player with lives wins, then everyone returns to the map editor.
+
 Architecture
   Game        - pure, deterministic game engine. No I/O, injectable clock and RNG,
                 so it is fully unit-testable.
@@ -43,6 +47,13 @@ class _Never(Exception):
 TerminalSizeChanged = getattr(asyncssh, "TerminalSizeChanged", _Never)
 
 HUD_ROWS = 4
+
+# 5-row block digits for the full-screen countdown
+BIG = {
+    "3": [" ##### ", "     ##", "  #### ", "     ##", " ##### "],
+    "2": [" ##### ", "     ##", " ##### ", "##     ", "#######"],
+    "1": ["   ##  ", " ####  ", "   ##  ", "   ##  ", " ######"],
+}
 ENTER = "\x1b[?1049h\x1b[2J\x1b[?25l"      # alt screen, clear, hide cursor
 LEAVE = "\x1b[?25h\x1b[?1049l"             # show cursor, leave alt screen
 BACKLOG_LIMIT = 64 * 1024                  # skip frames for clients this far behind
@@ -62,7 +73,7 @@ class Config:
     rapid_cooldown: float = 0.08
     bullet_speed: int = 2
     start_lives: int = 3
-    gameover_delay: float = 15
+    win_display: float = 6            # seconds the winner screen shows
     powerup_time: float = 10
     powerup_every: float = 8
     powerup_max: int = 3
@@ -120,6 +131,7 @@ class KeyParser:
     ARROWS = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
     PLAIN = {" ": "FIRE", "w": "UP", "s": "DOWN", "a": "LEFT", "d": "RIGHT",
              "W": "UP", "S": "DOWN", "A": "LEFT", "D": "RIGHT",
+             "\r": "ENTER", "\n": "ENTER",
              "q": "QUIT", "Q": "QUIT", "\x03": "QUIT", "\x04": "QUIT"}
 
     def __init__(self):
@@ -221,19 +233,56 @@ class Game:
         self.powerups: List[list] = []        # [x, y, kind]
         self._next_id = 0
         self._next_powerup = 0.0
+        self.walls: set = set()                     # {(x, y)}
+        self.phase = "EDIT"                         # EDIT | COUNTDOWN | PLAY | WIN
+        self.admin_id: Optional[int] = None
+        self.cursor = [cfg.width // 2, cfg.height // 2]
+        self.phase_until = 0.0
+        self.round_size = 0
+        self.winner = ""
 
     # ---- players
     def add_player(self, name: str) -> Tank:
         self._next_id += 1
         now = self.clock()
-        t = Tank(self._next_id, name or f"tank{self._next_id}", lives=self.cfg.start_lives,
+        joinable = self.phase in ("EDIT", "COUNTDOWN")   # mid-round joiners spectate
+        t = Tank(self._next_id, name or f"tank{self._next_id}",
+                 lives=self.cfg.start_lives if joinable else 0,
                  respawn_at=now, tokens=float(self.cfg.input_burst), last_refill=now)
         self.tanks[t.id] = t
+        if self.admin_id is None:
+            self.admin_id = t.id
         return t
 
     def remove_player(self, tank: Tank) -> None:
         self.tanks.pop(tank.id, None)
         self.bullets = [b for b in self.bullets if b.owner != tank.id]
+        if self.admin_id == tank.id:
+            self.admin_id = min(self.tanks, default=None)   # earliest joiner takes over
+        if not self.tanks:
+            self._enter_edit(clear_walls=True)
+
+    # ---- phase transitions
+    def _enter_edit(self, clear_walls: bool = False) -> None:
+        self.phase = "EDIT"
+        self.bullets, self.powerups = [], []
+        if clear_walls:
+            self.walls.clear()
+            self.cursor = [self.cfg.width // 2, self.cfg.height // 2]
+        for t in self.tanks.values():
+            t.alive, t.clone, t.powerup = False, None, None
+            t.lives = self.cfg.start_lives
+            t.inbox.clear()
+
+    def _start_round(self, now: float) -> None:
+        self.phase = "PLAY"
+        self.round_size = len(self.tanks)
+        self.bullets, self.powerups = [], []
+        self._next_powerup = now + self.cfg.powerup_every
+        for t in self.tanks.values():
+            t.lives, t.kills, t.deaths = self.cfg.start_lives, 0, 0
+            t.alive, t.clone, t.powerup, t.respawn_at = False, None, None, now
+            t.inbox.clear()
 
     def push_input(self, t: Tank, key: str) -> bool:
         """Token-bucket rate limited, bounded input queue (anti-flood)."""
@@ -253,6 +302,8 @@ class Game:
         return 1 <= x <= self.cfg.width - 2 and 1 <= y <= self.cfg.height - 2
 
     def occupied(self, x, y, ignore: Optional[Tank] = None) -> bool:
+        if (x, y) in self.walls:
+            return True
         for t in self.tanks.values():
             if t.alive and ((t.x, t.y) == (x, y) or t.clone == (x, y)):
                 if t is not ignore:
@@ -265,11 +316,16 @@ class Game:
         others = [t for t in self.tanks.values() if t.alive]
         for _ in range(60):
             x, y = self.rng.randint(2, W - 3), self.rng.randint(2, H - 3)
+            if (x, y) in self.walls:
+                continue
             d = min((cheb(t.x, t.y, x, y) for t in others), default=99)
             if d > 4:
                 return x, y
             if d > best_d:
                 best, best_d = (x, y), d
+        if best in self.walls:
+            best = next(((x, y) for y in range(1, H - 1) for x in range(1, W - 1)
+                         if (x, y) not in self.walls), best)
         return best                                  # crowded arena: farthest candidate
 
     # ---- actions
@@ -327,7 +383,7 @@ class Game:
         t.deaths += 1
         t.lives -= 1
         t.powerup, t.clone = None, None
-        t.respawn_at = now + (self.cfg.respawn_delay if t.lives > 0 else self.cfg.gameover_delay)
+        t.respawn_at = now + (self.cfg.respawn_delay if t.lives > 0 else 0)
         killer = self.tanks.get(killer_id)
         if killer and killer is not t:
             killer.kills += 1
@@ -355,10 +411,46 @@ class Game:
     # ---- simulation step
     def tick(self) -> None:
         now = self.clock()
+        if self.phase == "PLAY":
+            self._tick_play(now)
+        elif self.phase == "EDIT":
+            self._tick_edit(now)
+        else:                                        # COUNTDOWN / WIN ignore input
+            for t in self.tanks.values():
+                t.inbox.clear()
+            if now >= self.phase_until:
+                if self.phase == "COUNTDOWN":
+                    self._start_round(now)
+                else:
+                    self._enter_edit()
+
+    def _tick_edit(self, now: float) -> None:
+        for t in self.tanks.values():
+            while t.inbox:
+                key = t.inbox.popleft()
+                if t.id != self.admin_id:
+                    continue
+                if key in MOVES:
+                    dx, dy = MOVES[key]
+                    nx, ny = self.cursor[0] + dx, self.cursor[1] + dy
+                    if self.in_bounds(nx, ny):
+                        self.cursor = [nx, ny]
+                elif key == "FIRE":
+                    self.walls.symmetric_difference_update({(self.cursor[0], self.cursor[1])})
+                elif key == "ENTER":
+                    self.phase, self.phase_until = "COUNTDOWN", now + 3
+                    for o in self.tanks.values():
+                        o.inbox.clear()
+                    return
+
+    def _tick_play(self, now: float) -> None:
         cfg = self.cfg
         for t in list(self.tanks.values()):
             while t.inbox:
                 key = t.inbox.popleft()
+                if key == "ENTER" and t.id == self.admin_id and self.round_size < 2:
+                    self._enter_edit()               # solo round: admin ends it
+                    return
                 if not t.alive:
                     continue
                 if key == "FIRE":
@@ -366,9 +458,7 @@ class Game:
                 elif key in MOVES:
                     self._move(t, key)
         for t in self.tanks.values():
-            if not t.alive and now >= t.respawn_at:
-                if t.lives <= 0:
-                    t.lives = cfg.start_lives
+            if not t.alive and t.lives > 0 and now >= t.respawn_at:
                 t.x, t.y = self.spawn_point()
                 t.alive = True
                 t.shield_until = now + cfg.shield_time
@@ -392,7 +482,8 @@ class Game:
         for b in self.bullets:
             dead = False
             for _ in range(b.speed):
-                if not self.in_bounds(b.x, b.y) or self._bullet_hits(b, now):
+                if (not self.in_bounds(b.x, b.y) or (b.x, b.y) in self.walls
+                        or self._bullet_hits(b, now)):
                     dead = True
                     break
                 b.x += b.dx
@@ -400,6 +491,11 @@ class Game:
             if not dead:
                 survivors.append(b)
         self.bullets = survivors
+        if self.round_size >= 2:                     # last player with lives wins
+            alive = [t for t in self.tanks.values() if t.lives > 0]
+            if len(alive) <= 1:
+                self.winner = alive[0].name if alive else ""
+                self.phase, self.phase_until = "WIN", now + cfg.win_display
 
     # ---- rendering
     @staticmethod
@@ -408,14 +504,63 @@ class Game:
             return "\\" if dx == dy else "/"
         return "|" if dy else "-"
 
-    def render(self, me: Tank, now: Optional[float] = None) -> List[str]:
-        now = self.clock() if now is None else now
+    def _grid(self) -> List[List[str]]:
         W, H = self.cfg.width, self.cfg.height
         g = [[" "] * W for _ in range(H)]
         for x in range(W):
             g[0][x] = g[H - 1][x] = "#"
         for y in range(H):
             g[y][0] = g[y][W - 1] = "#"
+        for x, y in self.walls:
+            g[y][x] = "\x1b[35m#\x1b[0m"
+        return g
+
+    def _screen(self, lines: List[str]) -> List[str]:
+        """Centered full-screen text frame with exactly height+HUD_ROWS rows."""
+        W, total = self.cfg.width, self.cfg.height + HUD_ROWS
+        rows = [""] * max(0, (total - len(lines)) // 2) + [l.center(W) for l in lines]
+        rows = rows[:total] + [""] * (total - len(rows))
+        return [r + "\x1b[K" for r in rows]
+
+    def render(self, me: Tank, now: Optional[float] = None) -> List[str]:
+        now = self.clock() if now is None else now
+        if self.phase == "EDIT":
+            return self._render_edit(me)
+        if self.phase == "COUNTDOWN":
+            n = min(3, int(max(0.0, self.phase_until - now)) + 1)
+            art = [("".join(c * 3 for c in row)) for row in BIG[str(n)] for _ in (0, 1)]
+            return self._screen(["GET READY", ""] + art + ["", "Arrows/WASD move  Space shoot"])
+        if self.phase == "WIN":
+            who = self.winner or "Nobody - it's a draw"
+            return self._screen(["*** ROUND OVER ***", "", f"WINNER: {who}", "",
+                                 "Back to the map editor shortly..."])
+        return self._render_play(me, now)
+
+    def _render_edit(self, me: Tank) -> List[str]:
+        admin = self.tanks.get(self.admin_id)
+        if me.id != self.admin_id:                   # waiting room
+            lines = ["=== WAITING ROOM ===", "",
+                     f"{admin.name if admin else '?'} (admin) is editing the map...", "",
+                     f"Players ({len(self.tanks)}):"]
+            for t in list(self.tanks.values())[:12]:
+                tag = " (admin)" if t.id == self.admin_id else (" (you)" if t is me else "")
+                lines.append(f"- {t.name}{tag}")
+            lines += ["", "The game starts when the admin presses Enter.  Q quit"]
+            return self._screen(lines)
+        g = self._grid()
+        cx, cy = self.cursor
+        g[cy][cx] = "\x1b[1;33;7m#\x1b[0m"
+        rows = ["".join(r) for r in g]
+        names = ", ".join(t.name for t in self.tanks.values())
+        rows.append(f"MAP EDITOR - you are the admin | Walls: {len(self.walls)}\x1b[K")
+        rows.append("Arrows/WASD move cursor | Space place/remove wall | Enter start game\x1b[K")
+        rows.append(f"Players: {names}"[: self.cfg.width] + "\x1b[K")
+        rows.append("Q quit\x1b[K")
+        return rows
+
+    def _render_play(self, me: Tank, now: float) -> List[str]:
+        W, H = self.cfg.width, self.cfg.height
+        g = self._grid()
         for t in self.tanks.values():
             if t.shielded(now):
                 for dx in (-1, 0, 1):
@@ -444,15 +589,16 @@ class Game:
             if me.powerup:
                 status += f" | {POWERUPS[me.powerup]} {max(0, me.powerup_until - now):.0f}s"
         elif me.lives <= 0:
-            status = f"GAME OVER - rejoining in {max(0, me.respawn_at - now):.0f}s"
+            status = "OUT - spectating"
         else:
             status = f"Destroyed! Respawn in {max(0, me.respawn_at - now):.0f}s"
         top = sorted(self.tanks.values(), key=lambda t: (-t.kills, t.deaths, t.id))[:3]
         board = "  ".join(f"{i + 1}.{t.name} {t.kills}" for i, t in enumerate(top))
         rows.append(f"Lives: {hearts} | Kills: {me.kills} | Players: {len(self.tanks)} | {status}\x1b[K")
         rows.append(f"Top: {board}\x1b[K")
+        solo = " | Enter: back to editor" if (me.id == self.admin_id and self.round_size < 2) else ""
         rows.append("Arrows/WASD move  Space shoot  Q quit | "
-                    "T=triple R=rapid P=pierce M=twin S=speed\x1b[K")
+                    f"T=triple R=rapid P=pierce M=twin S=speed{solo}\x1b[K")
         rows.append(f"Invite friends: {connect_hint(self.cfg)}\x1b[K")
         return rows
 
