@@ -120,9 +120,9 @@ def render_for(me):
                         if 0 < x < W - 1 and 0 < y < H - 1:
                             g[y][x] = ("+" if abs(dx) == abs(dy) else
                                        "-" if dy else "|")
-    for bx, by, *_ in bullets:
+    for bx, by, bdx, bdy, _ in bullets:
         if 0 < bx < W - 1 and 0 < by < H - 1:
-            g[by][bx] = "-"
+            g[by][bx] = "|" if bdy else "-"   # vertical shot -> '|'
     for t in tanks.values():
         if t.alive:
             g[t.y][t.x] = (f"\x1b[1;32m{t.char}\x1b[0m" if t is me else t.char)
