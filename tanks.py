@@ -2,7 +2,7 @@
 """
 ASCII multiplayer tanks over SSH.
 
-Round flow: the first player in is the admin and edits the map (arrows/WASD move the
+Round flow: the first player in is the admin: picks the map size (small/medium/large), then edits the map (arrows/WASD move the
 '#' cursor, Space toggles a wall, Enter starts). Others wait in a lobby. After a 3-2-1
 countdown, last player with lives wins, then everyone returns to the map editor.
 
@@ -48,14 +48,21 @@ TerminalSizeChanged = getattr(asyncssh, "TerminalSizeChanged", _Never)
 
 HUD_ROWS = 4
 
+# Selectable map sizes: name -> (width, height). Large is the original arena.
+SIZES = [("Small", 30, 12), ("Medium", 44, 16), ("Large", 60, 20)]
+DEFAULT_SIZE = 2
+MAX_W, MAX_H = SIZES[-1][1], SIZES[-1][2]     # lobby screens / terminal minimum use the largest
+
 # 5-row block digits for the full-screen countdown
 BIG = {
     "3": [" ##### ", "     ##", "  #### ", "     ##", " ##### "],
     "2": [" ##### ", "     ##", " ##### ", "##     ", "#######"],
     "1": ["   ##  ", " ####  ", "   ##  ", "   ##  ", " ######"],
 }
-ENTER = "\x1b[?1049h\x1b[2J\x1b[?25l"      # alt screen, clear, hide cursor
-LEAVE = "\x1b[?25h\x1b[?1049l"             # show cursor, leave alt screen
+MOUSE_ON = "\x1b[?1000h\x1b[?1002h\x1b[?1006h"   # touch/mouse: press, drag, SGR coords
+MOUSE_OFF = "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
+ENTER = "\x1b[?1049h\x1b[2J\x1b[?25l" + MOUSE_ON   # alt screen, clear, hide cursor, touch on
+LEAVE = MOUSE_OFF + "\x1b[?25h\x1b[?1049l"             # show cursor, leave alt screen
 BACKLOG_LIMIT = 64 * 1024                  # skip frames for clients this far behind
 
 
@@ -127,15 +134,47 @@ def connect_hint(cfg: "Config") -> str:
 
 # --------------------------------------------------------------------------- input
 class KeyParser:
-    """Turns raw terminal bytes into UP/DOWN/LEFT/RIGHT/FIRE/QUIT tokens."""
+    """Turns raw terminal bytes into UP/DOWN/LEFT/RIGHT/FIRE/QUIT tokens (keys, plus touch swipes/taps)."""
     ARROWS = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
     PLAIN = {" ": "FIRE", "w": "UP", "s": "DOWN", "a": "LEFT", "d": "RIGHT",
              "W": "UP", "S": "DOWN", "A": "LEFT", "D": "RIGHT",
              "\r": "ENTER", "\n": "ENTER",
              "q": "QUIT", "Q": "QUIT", "\x03": "QUIT", "\x04": "QUIT"}
 
+    SWIPE_X = 3          # columns of finger travel that count as a horizontal swipe
+    SWIPE_Y = 2          # rows of finger travel that count as a vertical swipe
+
     def __init__(self):
         self.buf = ""
+        self.origin: Optional[Tuple[int, int]] = None   # where the current touch started
+        self.swiped = False                              # did this touch already steer?
+
+    def _mouse(self, params: str, final: str) -> Optional[str]:
+        """SGR mouse report (touch screens send these). Tap -> FIRE, swipe -> direction."""
+        try:
+            b, x, y = (int(p) for p in params.split(";"))
+        except ValueError:
+            return None
+        if b & 64 or (b & 3) != 0:                       # wheel / non-primary button
+            return None
+        if final == "M" and not (b & 32):                # touch down
+            self.origin, self.swiped = (x, y), False
+            return None
+        if self.origin is None:
+            return None
+        dx, dy = x - self.origin[0], y - self.origin[1]
+        tok = None
+        if abs(dx) >= self.SWIPE_X and abs(dx) >= 2 * abs(dy):   # cells are ~2x taller than wide
+            tok = "RIGHT" if dx > 0 else "LEFT"
+        elif abs(dy) >= self.SWIPE_Y and 2 * abs(dy) > abs(dx):
+            tok = "DOWN" if dy > 0 else "UP"
+        if final == "M":                                 # dragging: steer, then re-anchor
+            if tok:
+                self.origin, self.swiped = (x, y), True
+            return tok
+        tok = tok or (None if self.swiped else "FIRE")   # lift: swipe or tap
+        self.origin = None
+        return tok
 
     def feed(self, data: str) -> List[str]:
         buf = self.buf + data
@@ -155,6 +194,20 @@ class KeyParser:
                 if i + 2 >= n:
                     break
                 final = buf[i + 2]
+                if final == "<" and buf[i + 1] == "[":     # SGR mouse / touch report
+                    j = i + 3
+                    while j < n and buf[j] not in "Mm" and j - i < 24:
+                        j += 1
+                    if j >= n:
+                        break                              # incomplete: wait for more
+                    if buf[j] in "Mm":
+                        tok = self._mouse(buf[i + 3:j], buf[j])
+                        if tok:
+                            keys.append(tok)
+                        i = j + 1
+                    else:
+                        i += 3                             # garbage, resync
+                    continue
                 if final in self.ARROWS:
                     keys.append(self.ARROWS[final])
                     i += 3
@@ -167,7 +220,7 @@ class KeyParser:
                 i = j + 1
             else:
                 i += 2                                   # Alt+key: ignore
-        self.buf = buf[i:] if (n - i) <= 16 else ""      # never grow unbounded
+        self.buf = buf[i:] if (n - i) <= 32 else ""      # never grow unbounded
         return keys
 
 
@@ -234,9 +287,11 @@ class Game:
         self._next_id = 0
         self._next_powerup = 0.0
         self.walls: set = set()                     # {(x, y)}
-        self.phase = "EDIT"                         # EDIT | COUNTDOWN | PLAY | WIN
+        self.phase = "SIZE"                         # SIZE | EDIT | COUNTDOWN | PLAY | WIN
+        self.size_idx = DEFAULT_SIZE                # size currently applied to the arena
+        self.pick_idx = DEFAULT_SIZE                # size highlighted in the admin menu
+        self._apply_size(DEFAULT_SIZE)
         self.admin_id: Optional[int] = None
-        self.cursor = [cfg.width // 2, cfg.height // 2]
         self.phase_until = 0.0
         self.round_size = 0
         self.winner = ""
@@ -245,7 +300,7 @@ class Game:
     def add_player(self, name: str) -> Tank:
         self._next_id += 1
         now = self.clock()
-        joinable = self.phase in ("EDIT", "COUNTDOWN")   # mid-round joiners spectate
+        joinable = self.phase in ("SIZE", "EDIT", "COUNTDOWN")   # mid-round joiners spectate
         t = Tank(self._next_id, name or f"tank{self._next_id}",
                  lives=self.cfg.start_lives if joinable else 0,
                  respawn_at=now, tokens=float(self.cfg.input_burst), last_refill=now)
@@ -263,10 +318,24 @@ class Game:
             self._enter_edit(clear_walls=True)
 
     # ---- phase transitions
+    def _apply_size(self, idx: int) -> None:
+        """Set the arena dimensions. Walls/cursor reset if the size actually changed."""
+        _, w, h = SIZES[idx]
+        changed = (w, h) != (self.cfg.width, self.cfg.height)
+        self.size_idx = self.pick_idx = idx
+        self.cfg.width, self.cfg.height = w, h
+        if changed or not hasattr(self, "walls"):
+            self.walls = set()
+        if changed or not hasattr(self, "cursor"):
+            self.cursor = [w // 2, h // 2]
+
     def _enter_edit(self, clear_walls: bool = False) -> None:
-        self.phase = "EDIT"
+        """Back to the start of setup: admin picks the map size, then edits walls."""
+        self.phase = "SIZE"
+        self.pick_idx = self.size_idx
         self.bullets, self.powerups = [], []
         if clear_walls:
+            self._apply_size(DEFAULT_SIZE)
             self.walls.clear()
             self.cursor = [self.cfg.width // 2, self.cfg.height // 2]
         for t in self.tanks.values():
@@ -413,6 +482,8 @@ class Game:
         now = self.clock()
         if self.phase == "PLAY":
             self._tick_play(now)
+        elif self.phase == "SIZE":
+            self._tick_size(now)
         elif self.phase == "EDIT":
             self._tick_edit(now)
         else:                                        # COUNTDOWN / WIN ignore input
@@ -423,6 +494,23 @@ class Game:
                     self._start_round(now)
                 else:
                     self._enter_edit()
+
+    def _tick_size(self, now: float) -> None:
+        for t in self.tanks.values():
+            while t.inbox:
+                key = t.inbox.popleft()
+                if t.id != self.admin_id:
+                    continue
+                if key in ("LEFT", "UP"):
+                    self.pick_idx = max(0, self.pick_idx - 1)
+                elif key in ("RIGHT", "DOWN"):
+                    self.pick_idx = min(len(SIZES) - 1, self.pick_idx + 1)
+                elif key in ("ENTER", "FIRE"):          # Enter (or a tap) confirms
+                    self._apply_size(self.pick_idx)
+                    self.phase = "EDIT"
+                    for o in self.tanks.values():
+                        o.inbox.clear()
+                    return
 
     def _tick_edit(self, now: float) -> None:
         for t in self.tanks.values():
@@ -517,19 +605,19 @@ class Game:
 
     def _screen(self, lines: List[str]) -> List[str]:
         """Centered full-screen text frame with exactly height+HUD_ROWS rows."""
-        W, total = self.cfg.width, self.cfg.height + HUD_ROWS
+        W, total = MAX_W, MAX_H + HUD_ROWS
         rows = [""] * max(0, (total - len(lines)) // 2) + [l.center(W) for l in lines]
         rows = rows[:total] + [""] * (total - len(rows))
         return [r + "\x1b[K" for r in rows]
 
     def render(self, me: Tank, now: Optional[float] = None) -> List[str]:
         now = self.clock() if now is None else now
-        if self.phase == "EDIT":
+        if self.phase in ("SIZE", "EDIT"):
             return self._render_edit(me)
         if self.phase == "COUNTDOWN":
             n = min(3, int(max(0.0, self.phase_until - now)) + 1)
             art = [("".join(c * 3 for c in row)) for row in BIG[str(n)] for _ in (0, 1)]
-            return self._screen(["GET READY", ""] + art + ["", "Arrows/WASD move  Space shoot"])
+            return self._screen(["GET READY", ""] + art + ["", "Arrows/WASD or swipe to move  Space or tap to shoot"])
         if self.phase == "WIN":
             who = self.winner or "Nobody - it's a draw"
             return self._screen(["*** ROUND OVER ***", "", f"WINNER: {who}", "",
@@ -538,14 +626,26 @@ class Game:
 
     def _render_edit(self, me: Tank) -> List[str]:
         admin = self.tanks.get(self.admin_id)
+        doing = "choosing the map size" if self.phase == "SIZE" else "editing the map"
         if me.id != self.admin_id:                   # waiting room
             lines = ["=== WAITING ROOM ===", "",
-                     f"{admin.name if admin else '?'} (admin) is editing the map...", "",
+                     f"{admin.name if admin else '?'} (admin) is {doing}...", "",
                      f"Players ({len(self.tanks)}):"]
             for t in list(self.tanks.values())[:12]:
                 tag = " (admin)" if t.id == self.admin_id else (" (you)" if t is me else "")
                 lines.append(f"- {t.name}{tag}")
             lines += ["", "The game starts when the admin presses Enter.  Q quit"]
+            return self._screen(lines)
+        if self.phase == "SIZE":                     # admin: size picker
+            lines = ["=== CHOOSE MAP SIZE ===", "",
+                     "Arrows/WASD/swipe to choose  -  Enter or tap to confirm", ""]
+            for i, (name, w, h) in enumerate(SIZES):
+                mark = ">" if i == self.pick_idx else " "
+                lines.append(f"{mark} {name:<7} {w}x{h}" + ("  <" if i == self.pick_idx else ""))
+            _, pw, ph = SIZES[self.pick_idx]
+            lines += ["", "+" + "-" * (pw // 3) + "+"]
+            lines += ["|" + " " * (pw // 3) + "|" for _ in range(ph // 3)]
+            lines += ["+" + "-" * (pw // 3) + "+", "", f"Players: {len(self.tanks)}   Q quit"]
             return self._screen(lines)
         g = self._grid()
         cx, cy = self.cursor
@@ -553,7 +653,7 @@ class Game:
         rows = ["".join(r) for r in g]
         names = ", ".join(t.name for t in self.tanks.values())
         rows.append(f"MAP EDITOR - you are the admin | Walls: {len(self.walls)}\x1b[K")
-        rows.append("Arrows/WASD move cursor | Space place/remove wall | Enter start game\x1b[K")
+        rows.append("Arrows/WASD/swipe move | Space/tap wall | Enter start\x1b[K")
         rows.append(f"Players: {names}"[: self.cfg.width] + "\x1b[K")
         rows.append("Q quit\x1b[K")
         return rows
@@ -597,7 +697,7 @@ class Game:
         rows.append(f"Lives: {hearts} | Kills: {me.kills} | Players: {len(self.tanks)} | {status}\x1b[K")
         rows.append(f"Top: {board}\x1b[K")
         solo = " | Enter: back to editor" if (me.id == self.admin_id and self.round_size < 2) else ""
-        rows.append("Arrows/WASD move  Space shoot  Q quit | "
+        rows.append("Arrows/WASD/swipe move  Space/tap shoot  Q quit | "
                     f"T=triple R=rapid P=pierce M=twin S=speed{solo}\x1b[K")
         rows.append(f"Invite friends: {connect_hint(self.cfg)}\x1b[K")
         return rows
@@ -628,7 +728,7 @@ class Session:
         except Exception:
             cols = rows = 0
         self.cols, self.rows = cols, rows
-        self.size_ok = cols == 0 or (cols >= self.cfg.width and rows >= self.cfg.height + HUD_ROWS)
+        self.size_ok = cols == 0 or (cols >= MAX_W and rows >= MAX_H + HUD_ROWS)
         self.last_rows, self.warned = None, False
 
     def write(self, s: str) -> None:
@@ -649,15 +749,16 @@ class Session:
         if not self.size_ok:
             if not self.warned:
                 self.warned = True
-                self.write(f"\x1b[2J\x1b[HTerminal too small: need {self.cfg.width}x"
-                           f"{self.cfg.height + HUD_ROWS}, have {self.cols}x{self.rows}. Resize the window.")
+                self.write(f"\x1b[2J\x1b[HTerminal too small: need {MAX_W}x"
+                           f"{MAX_H + HUD_ROWS}, have {self.cols}x{self.rows}. Resize the window.")
             return
         if self.backlog() > BACKLOG_LIMIT:           # slow client: drop frame, never queue
             self.last_rows = None
             return
-        parts = ["\x1b[2J"] if self.last_rows is None else []
+        full = self.last_rows is None or len(self.last_rows) != len(rows)   # size changed -> redraw
+        parts = ["\x1b[2J"] if full else []
         for i, row in enumerate(rows):
-            if self.last_rows is None or self.last_rows[i] != row:
+            if full or self.last_rows[i] != row:
                 parts.append(f"\x1b[{i + 1};1H{row}")
         if parts:
             self.write("".join(parts))

@@ -22,37 +22,63 @@
 ssh -p 1111 <server-ip>
 ```
 
-No client to install. Your SSH username becomes your tank name. Your terminal must be at least **60x24**.
+No client to install. Your SSH username becomes your tank name. Your terminal must be at least **60x24** (even on the smaller maps, so the lobby and countdown screens fit).
+
+Playing on a phone or tablet? Use an SSH app with mouse/touch reporting and just **swipe to move** and **tap to shoot**. See [Touch controls](#touch-controls).
 
 ## How a round works
 
 | Step | What happens |
 |------|--------------|
-| 1. Map editor | The first player in is the **admin** and builds the map. |
-| 2. Waiting room | Everyone else sees the player list and "admin is editing the map". |
-| 3. Countdown | Admin hits **Enter**, then a full-screen 3-2-1 ASCII countdown runs. |
-| 4. Battle | Everyone gets **3 lives**. Get hit, lose a life, respawn. Lose your last life and you're out. |
-| 5. Winner | The last player with lives wins, then everyone returns to the editor. |
+| 1. Pick a map size | The first player in is the **admin** and chooses **Small**, **Medium** or **Large**. |
+| 2. Map editor | The admin places walls on the chosen map. |
+| 3. Waiting room | Everyone else sees the player list and "admin is choosing the map size" or "editing the map". |
+| 4. Countdown | Admin hits **Enter**, then a full-screen 3-2-1 ASCII countdown runs. |
+| 5. Battle | Everyone gets **3 lives**. Get hit, lose a life, respawn. Lose your last life and you're out. |
+| 6. Winner | The last player with lives wins, then everyone returns to the size picker. |
+
+### Map sizes
+
+| Size | Arena | Good for |
+|------|-------|----------|
+| Small | 30x12 | 2-4 players, fast and chaotic |
+| Medium | 44x16 | 4-8 players |
+| Large | 60x20 | Big groups (the default) |
 
 - If the admin disconnects, the longest-connected player becomes admin.
 - Players who join mid-round spectate until the next round.
-- Walls persist between rounds and reset when the server empties.
-- In a solo round there is no winner. The admin presses **Enter** to return to the editor.
+- Walls persist between rounds if the admin re-confirms the same size. Picking a different size clears them, and they also reset when the server empties.
+- When the server empties, the next game starts fresh on Large.
+- In a solo round there is no winner. The admin presses **Enter** to return to the size picker.
 
-| Map editor | Waiting room |
+| Map size picker | Map editor |
 |:---:|:---:|
-| ![Editor](docs/editor.png) | ![Waiting](docs/waiting-room.png) |
-| **Countdown** | **Winner screen** |
-| ![Countdown](docs/countdown.png) | ![Winner](docs/winner.png) |
+| ![Size picker](docs/size-picker.png) | ![Editor](docs/editor.png) |
+| **Waiting room** | **Countdown** |
+| ![Waiting](docs/waiting-room.png) | ![Countdown](docs/countdown.png) |
+| **Winner screen** | |
+| ![Winner](docs/winner.png) | |
 
 ## Controls
 
-| Key | Battle | Map editor (admin) |
-|-----|--------|--------------------|
-| Arrows / WASD | Move tank | Move `#` cursor |
-| Space | Shoot | Place / remove wall |
-| Enter | Back to editor (solo round, admin only) | Start the game |
-| Q | Quit | Quit |
+| Input | Battle | Size picker (admin) | Map editor (admin) |
+|-------|--------|---------------------|--------------------|
+| Arrows / WASD | Move tank | Change size | Move `#` cursor |
+| Space | Shoot | Confirm size | Place / remove wall |
+| Enter | Back to size picker (solo round, admin only) | Confirm size | Start the game |
+| Q | Quit | Quit | Quit |
+
+### Touch controls
+
+If your terminal supports mouse/touch reporting (Termux, Blink Shell and similar apps generally do), you can play without a keyboard:
+
+| Gesture | Action |
+|---------|--------|
+| Swipe left / right / up / down | Move the tank (or the cursor / size selection for the admin) |
+| Hold and keep dragging | Keep moving in that direction |
+| Tap | Shoot (or confirm size / toggle a wall for the admin) |
+
+The game turns mouse reporting on when you join and off when you leave. Some terminals use touch-drag for text selection and may swallow the gestures. Keyboard controls always keep working. Swipe sensitivity can be tuned with `SWIPE_X` and `SWIPE_Y` in `KeyParser`.
 
 ## Power-ups
 
@@ -83,7 +109,7 @@ python3 tanks.py --port 1111 --public-host YOUR.PUBLIC.IP
 
 ## Under the hood
 
-- `Game`: pure, deterministic engine with phases EDIT, COUNTDOWN, PLAY and WIN.
-- `KeyParser`: terminal input parser that handles split escape sequences.
+- `Game`: pure, deterministic engine with phases SIZE, EDIT, COUNTDOWN, PLAY and WIN.
+- `KeyParser`: terminal input parser that handles split escape sequences, plus touch taps and swipes.
 - `Session`: per-player input loop with diff-based rendering and backpressure.
 - `TankServer`: SSH front end with connection limits and a fixed-timestep game loop.
