@@ -1,20 +1,78 @@
 #!/usr/bin/env python3
-"""ASCII multiplayer tank game over SSH on port 1111."""
-import asyncio, asyncssh, os, random, re, time
+"""
+ASCII multiplayer tanks over SSH.
 
-PORT = 1111
-W, H = 60, 20            # arena size (including border)
-TICK = 0.08              # seconds per frame
-RESPAWN_DELAY = 10
-SHIELD_TIME = 3
-SHOT_COOLDOWN = 0.3
-BULLET_SPEED = 2         # cells per tick
-START_LIVES = 3
-GAMEOVER_DELAY = 15      # wait after losing the last life, then rejoin with fresh lives
-POWERUP_TIME = 10
-POWERUP_EVERY = 8
-POWERUP_MAX = 3
-HKEY = "ssh_host_key"
+Architecture
+  Game        - pure, deterministic game engine. No I/O, injectable clock and RNG,
+                so it is fully unit-testable.
+  KeyParser   - stateful terminal input parser (handles split escape sequences).
+  Session     - one connected player: input loop, diff-based rendering, backpressure.
+  TankServer  - SSH front end: connection limits, game loop at a fixed timestep.
+
+Run:   pip install asyncssh && python3 tanks.py --port 1111
+Join:  ssh -p 1111 <host>          (optional password: export TANKS_PASSWORD=...)
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hmac
+import logging
+import os
+import random
+import re
+import signal
+import time
+from collections import Counter, deque
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
+
+try:
+    import asyncssh
+except ImportError:          # engine + tests still work without it
+    asyncssh = None
+
+log = logging.getLogger("tanks")
+
+
+class _Never(Exception):
+    pass
+
+
+TerminalSizeChanged = getattr(asyncssh, "TerminalSizeChanged", _Never)
+
+HUD_ROWS = 3
+ENTER = "\x1b[?1049h\x1b[2J\x1b[?25l"      # alt screen, clear, hide cursor
+LEAVE = "\x1b[?25h\x1b[?1049l"             # show cursor, leave alt screen
+BACKLOG_LIMIT = 64 * 1024                  # skip frames for clients this far behind
+
+
+# --------------------------------------------------------------------------- config
+@dataclass
+class Config:
+    host: str = ""
+    port: int = 1111
+    width: int = 60
+    height: int = 20
+    tick: float = 0.08
+    respawn_delay: float = 10
+    shield_time: float = 3
+    shot_cooldown: float = 0.3
+    rapid_cooldown: float = 0.08
+    bullet_speed: int = 2
+    start_lives: int = 3
+    gameover_delay: float = 15
+    powerup_time: float = 10
+    powerup_every: float = 8
+    powerup_max: int = 3
+    max_players: int = 30
+    max_per_ip: int = 4
+    idle_timeout: float = 120
+    input_rate: float = 30.0          # sustained keys/second per player
+    input_burst: int = 20
+    host_key: str = "ssh_host_key"
+    password: Optional[str] = None
+
 
 POWERUPS = {
     "T": "Triple Shot",
@@ -24,325 +82,591 @@ POWERUPS = {
     "S": "Speed Boost",
 }
 
-tanks = {}               # id -> Tank
-bullets = []             # [x, y, dx, dy, owner_id, pierce, speed]
-powerups = []            # [x, y, kind]
-next_id = 0
-next_powerup_at = 0
+MOVES = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
 
 
+# --------------------------------------------------------------------------- input
+class KeyParser:
+    """Turns raw terminal bytes into UP/DOWN/LEFT/RIGHT/FIRE/QUIT tokens."""
+    ARROWS = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
+    PLAIN = {" ": "FIRE", "w": "UP", "s": "DOWN", "a": "LEFT", "d": "RIGHT",
+             "W": "UP", "S": "DOWN", "A": "LEFT", "D": "RIGHT",
+             "q": "QUIT", "Q": "QUIT", "\x03": "QUIT", "\x04": "QUIT"}
+
+    def __init__(self):
+        self.buf = ""
+
+    def feed(self, data: str) -> List[str]:
+        buf = self.buf + data
+        keys: List[str] = []
+        i, n = 0, len(buf)
+        while i < n:
+            c = buf[i]
+            if c != "\x1b":
+                tok = self.PLAIN.get(c)
+                if tok:
+                    keys.append(tok)
+                i += 1
+                continue
+            if i + 1 >= n:
+                break                                   # lone ESC: wait for more
+            if buf[i + 1] in "[O":
+                if i + 2 >= n:
+                    break
+                final = buf[i + 2]
+                if final in self.ARROWS:
+                    keys.append(self.ARROWS[final])
+                    i += 3
+                    continue
+                j = i + 2                                # skip any other CSI/SS3 sequence
+                while j < n and not ("@" <= buf[j] <= "~"):
+                    j += 1
+                if j >= n:
+                    break
+                i = j + 1
+            else:
+                i += 2                                   # Alt+key: ignore
+        self.buf = buf[i:] if (n - i) <= 16 else ""      # never grow unbounded
+        return keys
+
+
+# --------------------------------------------------------------------------- engine
+@dataclass
+class Bullet:
+    x: int
+    y: int
+    dx: int
+    dy: int
+    owner: int
+    pierce: bool
+    speed: int
+
+
+@dataclass
 class Tank:
-    def __init__(self, tid, out):
-        self.id, self.out = tid, out
-        self.x = self.y = 0
-        self.dx, self.dy = 1, 0
-        self.vertical = False        # True -> 'H', False -> I-beam
-        self.alive = False
-        self.respawn_at = 0          # spawns on first tick
-        self.shield_until = 0
-        self.last_shot = 0
-        self.kills = 0
-        self.lives = START_LIVES
-        self.powerup = None          # key into POWERUPS
-        self.powerup_until = 0
-        self.clone = None            # (x, y) of Twin Tank clone
+    id: int
+    name: str
+    x: int = 0
+    y: int = 0
+    dx: int = 1
+    dy: int = 0
+    alive: bool = False
+    respawn_at: float = 0.0
+    shield_until: float = 0.0
+    last_shot: float = 0.0
+    kills: int = 0
+    deaths: int = 0
+    lives: int = 3
+    powerup: Optional[str] = None
+    powerup_until: float = 0.0
+    clone: Optional[Tuple[int, int]] = None
+    inbox: deque = field(default_factory=lambda: deque(maxlen=64))
+    tokens: float = 0.0
+    last_refill: float = 0.0
+    dropped: int = 0
 
     @property
-    def shielded(self):
-        return self.alive and time.time() < self.shield_until
+    def vertical(self) -> bool:
+        return self.dy != 0
 
     @property
-    def char(self):
+    def char(self) -> str:
         return "H" if self.vertical else "\u2336"
 
-
-def cell_taken(x, y, ignore=None):
-    for t in tanks.values():
-        if t.alive and t is not ignore:
-            if (t.x, t.y) == (x, y) or t.clone == (x, y):
-                return True
-    return False
+    def shielded(self, now: float) -> bool:
+        return self.alive and now < self.shield_until
 
 
-def spawn_point():
-    for _ in range(300):
-        x, y = random.randint(2, W - 3), random.randint(2, H - 3)
-        if all(not t.alive or max(abs(t.x - x), abs(t.y - y)) > 4
-               for t in tanks.values()):
-            return x, y
-    return random.randint(2, W - 3), random.randint(2, H - 3)
+def cheb(ax, ay, bx, by) -> int:
+    return max(abs(ax - bx), abs(ay - by))
 
 
-def occupied(x, y, ignore=None):
-    if cell_taken(x, y, ignore):
+class Game:
+    def __init__(self, cfg: Config, clock: Callable[[], float] = time.monotonic,
+                 rng: Optional[random.Random] = None):
+        self.cfg = cfg
+        self.clock = clock
+        self.rng = rng or random.Random()
+        self.tanks: Dict[int, Tank] = {}
+        self.bullets: List[Bullet] = []
+        self.powerups: List[list] = []        # [x, y, kind]
+        self._next_id = 0
+        self._next_powerup = 0.0
+
+    # ---- players
+    def add_player(self, name: str) -> Tank:
+        self._next_id += 1
+        now = self.clock()
+        t = Tank(self._next_id, name or f"tank{self._next_id}", lives=self.cfg.start_lives,
+                 respawn_at=now, tokens=float(self.cfg.input_burst), last_refill=now)
+        self.tanks[t.id] = t
+        return t
+
+    def remove_player(self, tank: Tank) -> None:
+        self.tanks.pop(tank.id, None)
+        self.bullets = [b for b in self.bullets if b.owner != tank.id]
+
+    def push_input(self, t: Tank, key: str) -> bool:
+        """Token-bucket rate limited, bounded input queue (anti-flood)."""
+        now = self.clock()
+        t.tokens = min(self.cfg.input_burst,
+                       t.tokens + (now - t.last_refill) * self.cfg.input_rate)
+        t.last_refill = now
+        if t.tokens < 1:
+            t.dropped += 1
+            return False
+        t.tokens -= 1
+        t.inbox.append(key)
         return True
-    if ignore is not None and ignore.clone == (x, y):
-        return True
-    return False
 
+    # ---- helpers
+    def in_bounds(self, x, y) -> bool:
+        return 1 <= x <= self.cfg.width - 2 and 1 <= y <= self.cfg.height - 2
 
-def free_cell(x, y):
-    return 1 <= x <= W - 2 and 1 <= y <= H - 2
+    def occupied(self, x, y, ignore: Optional[Tank] = None) -> bool:
+        for t in self.tanks.values():
+            if t.alive and ((t.x, t.y) == (x, y) or t.clone == (x, y)):
+                if t is not ignore:
+                    return True
+        return ignore is not None and ignore.clone == (x, y)
 
+    def spawn_point(self) -> Tuple[int, int]:
+        W, H = self.cfg.width, self.cfg.height
+        best, best_d = (W // 2, H // 2), -1
+        others = [t for t in self.tanks.values() if t.alive]
+        for _ in range(60):
+            x, y = self.rng.randint(2, W - 3), self.rng.randint(2, H - 3)
+            d = min((cheb(t.x, t.y, x, y) for t in others), default=99)
+            if d > 4:
+                return x, y
+            if d > best_d:
+                best, best_d = (x, y), d
+        return best                                  # crowded arena: farthest candidate
 
-def give_powerup(t, kind, now):
-    t.powerup = kind
-    t.powerup_until = now + POWERUP_TIME
-    t.clone = None
-    if kind == "M":
-        for ox, oy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1)):
-            cx, cy = t.x + ox, t.y + oy
-            if free_cell(cx, cy) and not occupied(cx, cy, t):
-                t.clone = (cx, cy)
-                break
+    # ---- actions
+    def _give_powerup(self, t: Tank, kind: str, now: float) -> None:
+        t.powerup, t.powerup_until, t.clone = kind, now + self.cfg.powerup_time, None
+        if kind == "M":
+            for ox, oy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1)):
+                cx, cy = t.x + ox, t.y + oy
+                if self.in_bounds(cx, cy) and not self.occupied(cx, cy, t):
+                    t.clone = (cx, cy)
+                    break
 
-
-def pickup_check(t, now):
-    for p in powerups[:]:
-        if (p[0], p[1]) == (t.x, t.y):
-            powerups.remove(p)
-            give_powerup(t, p[2], now)
-
-
-def fire(t, now):
-    cd = 0.08 if t.powerup == "R" else SHOT_COOLDOWN
-    if not t.alive or now - t.last_shot < cd:
-        return
-    t.last_shot = now
-    pierce = t.powerup == "P"
-    speed = BULLET_SPEED + (1 if t.powerup == "S" else 0)
-    if t.powerup == "T":
-        if t.dx:
-            dirs = [(t.dx, -1), (t.dx, 0), (t.dx, 1)]
+    def _fire(self, t: Tank, now: float) -> None:
+        cd = self.cfg.rapid_cooldown if t.powerup == "R" else self.cfg.shot_cooldown
+        if not t.alive or now - t.last_shot < cd:
+            return
+        t.last_shot = now
+        pierce = t.powerup == "P"
+        speed = self.cfg.bullet_speed + (1 if t.powerup == "S" else 0)
+        if t.powerup == "T":
+            dirs = ([(t.dx, -1), (t.dx, 0), (t.dx, 1)] if t.dx
+                    else [(-1, t.dy), (0, t.dy), (1, t.dy)])
         else:
-            dirs = [(-1, t.dy), (0, t.dy), (1, t.dy)]
-    else:
-        dirs = [(t.dx, t.dy)]
-    origins = [(t.x, t.y)]
-    if t.clone:
-        origins.append(t.clone)
-    for ox, oy in origins:
-        for dx, dy in dirs:
-            bullets.append([ox + dx, oy + dy, dx, dy, t.id, pierce, speed])
+            dirs = [(t.dx, t.dy)]
+        origins = [(t.x, t.y)] + ([t.clone] if t.clone else [])
+        for ox, oy in origins:
+            for dx, dy in dirs:
+                self.bullets.append(Bullet(ox + dx, oy + dy, dx, dy, t.id, pierce, speed))
 
-
-def handle_key(t, key):
-    now = time.time()
-    if key == " ":
-        fire(t, now)
-        return
-    moves = {"UP": (0, -1, True), "DOWN": (0, 1, True),
-             "LEFT": (-1, 0, False), "RIGHT": (1, 0, False)}
-    if key in moves and t.alive:
-        dx, dy, vert = moves[key]
-        t.dx, t.dy, t.vertical = dx, dy, vert
+    def _move(self, t: Tank, key: str) -> None:
+        dx, dy = MOVES[key]
+        t.dx, t.dy = dx, dy
         steps = 2 if t.powerup == "S" else 1
         for _ in range(steps):
             nx, ny = t.x + dx, t.y + dy
-            if free_cell(nx, ny) and not occupied(nx, ny, t):
+            if self.in_bounds(nx, ny) and not self.occupied(nx, ny, t):
                 t.x, t.y = nx, ny
             else:
                 break
-        if t.clone:                       # clone mirrors the move
+        if t.clone:                                  # clone mirrors movement
             cx, cy = t.clone
             for _ in range(steps):
                 nx, ny = cx + dx, cy + dy
-                if (free_cell(nx, ny) and (nx, ny) != (t.x, t.y)
-                        and not occupied(nx, ny, t)):
+                if self.in_bounds(nx, ny) and (nx, ny) != (t.x, t.y) and not self.occupied(nx, ny, t):
                     cx, cy = nx, ny
                 else:
                     break
             t.clone = (cx, cy)
-        pickup_check(t, now)
 
-
-def damage(t, killer_id, now):
-    """Main tank was hit."""
-    if t.clone:                           # clone absorbs the hit
-        t.x, t.y = t.clone
-        t.clone = None
-        return
-    t.alive = False
-    t.lives -= 1
-    t.powerup = None
-    t.clone = None
-    t.respawn_at = now + (RESPAWN_DELAY if t.lives > 0 else GAMEOVER_DELAY)
-    if killer_id in tanks:
-        tanks[killer_id].kills += 1
-
-
-def bullet_hit(b, now):
-    """Returns True if the bullet should be destroyed."""
-    x, y, _, _, owner, pierce, _ = b
-    stop = False
-    for t in list(tanks.values()):
-        if not t.alive or t.id == owner:
-            continue
-        if t.shielded and not pierce and max(abs(t.x - x), abs(t.y - y)) <= 1:
-            return True
-        if (t.x, t.y) == (x, y):
-            damage(t, owner, now)
-            stop = True
-        elif t.clone == (x, y):
+    def _damage(self, t: Tank, killer_id: int, now: float) -> None:
+        if t.clone:                                  # twin tank absorbs one hit
             t.clone = None
-            stop = True
-        if stop and not pierce:
-            return True
-    return stop and not pierce
+            return
+        t.alive = False
+        t.deaths += 1
+        t.lives -= 1
+        t.powerup, t.clone = None, None
+        t.respawn_at = now + (self.cfg.respawn_delay if t.lives > 0 else self.cfg.gameover_delay)
+        killer = self.tanks.get(killer_id)
+        if killer and killer is not t:
+            killer.kills += 1
 
+    def _bullet_hits(self, b: Bullet, now: float) -> bool:
+        """Apply hits for bullet at its current cell. True -> bullet is consumed."""
+        for t in list(self.tanks.values()):
+            if not t.alive or t.id == b.owner:
+                continue
+            if t.shielded(now):                      # shield: invulnerable, blocks normal rounds
+                if not b.pierce and cheb(t.x, t.y, b.x, b.y) <= 1:
+                    return True
+                continue
+            hit = False
+            if (t.x, t.y) == (b.x, b.y):
+                self._damage(t, b.owner, now)
+                hit = True
+            elif t.clone == (b.x, b.y):
+                t.clone = None
+                hit = True
+            if hit and not b.pierce:
+                return True
+        return False
 
-def step_game():
-    global next_powerup_at
-    now = time.time()
-    for t in tanks.values():
-        if not t.alive and now >= t.respawn_at:
-            if t.lives <= 0:
-                t.lives = START_LIVES      # game over is over: fresh lives
-            t.x, t.y = spawn_point()
-            t.alive = True
-            t.shield_until = now + SHIELD_TIME
-        if t.powerup and now >= t.powerup_until:
-            t.powerup = None
-            t.clone = None
-    # power-up spawning
-    if now >= next_powerup_at:
-        next_powerup_at = now + POWERUP_EVERY
-        if len(powerups) < POWERUP_MAX and tanks:
-            for _ in range(100):
-                x, y = random.randint(2, W - 3), random.randint(2, H - 3)
-                if not cell_taken(x, y) and all((p[0], p[1]) != (x, y) for p in powerups):
-                    powerups.append([x, y, random.choice(list(POWERUPS))])
+    # ---- simulation step
+    def tick(self) -> None:
+        now = self.clock()
+        cfg = self.cfg
+        for t in list(self.tanks.values()):
+            while t.inbox:
+                key = t.inbox.popleft()
+                if not t.alive:
+                    continue
+                if key == "FIRE":
+                    self._fire(t, now)
+                elif key in MOVES:
+                    self._move(t, key)
+        for t in self.tanks.values():
+            if not t.alive and now >= t.respawn_at:
+                if t.lives <= 0:
+                    t.lives = cfg.start_lives
+                t.x, t.y = self.spawn_point()
+                t.alive = True
+                t.shield_until = now + cfg.shield_time
+            if t.powerup and now >= t.powerup_until:
+                t.powerup, t.clone = None, None
+            if t.alive:
+                for p in self.powerups[:]:
+                    if (p[0], p[1]) == (t.x, t.y):
+                        self.powerups.remove(p)
+                        self._give_powerup(t, p[2], now)
+        if now >= self._next_powerup:
+            self._next_powerup = now + cfg.powerup_every
+            if self.tanks and len(self.powerups) < cfg.powerup_max:
+                for _ in range(100):
+                    x = self.rng.randint(2, cfg.width - 3)
+                    y = self.rng.randint(2, cfg.height - 3)
+                    if not self.occupied(x, y) and all((p[0], p[1]) != (x, y) for p in self.powerups):
+                        self.powerups.append([x, y, self.rng.choice(list(POWERUPS))])
+                        break
+        survivors = []
+        for b in self.bullets:
+            dead = False
+            for _ in range(b.speed):
+                if not self.in_bounds(b.x, b.y) or self._bullet_hits(b, now):
+                    dead = True
                     break
-    # bullets
-    alive_bullets = []
-    for b in bullets:
-        dead = False
-        for _ in range(b[6]):
-            if not (1 <= b[0] <= W - 2 and 1 <= b[1] <= H - 2):
-                dead = True
-                break
-            if bullet_hit(b, now):
-                dead = True
-                break
-            b[0] += b[2]
-            b[1] += b[3]
-        if not dead:
-            alive_bullets.append(b)
-    bullets[:] = alive_bullets
+                b.x += b.dx
+                b.y += b.dy
+            if not dead:
+                survivors.append(b)
+        self.bullets = survivors
+
+    # ---- rendering
+    @staticmethod
+    def _bullet_char(dx, dy) -> str:
+        if dx and dy:
+            return "\\" if dx == dy else "/"
+        return "|" if dy else "-"
+
+    def render(self, me: Tank, now: Optional[float] = None) -> List[str]:
+        now = self.clock() if now is None else now
+        W, H = self.cfg.width, self.cfg.height
+        g = [[" "] * W for _ in range(H)]
+        for x in range(W):
+            g[0][x] = g[H - 1][x] = "#"
+        for y in range(H):
+            g[y][0] = g[y][W - 1] = "#"
+        for t in self.tanks.values():
+            if t.shielded(now):
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        if max(abs(dx), abs(dy)) == 1:
+                            x, y = t.x + dx, t.y + dy
+                            if 0 < x < W - 1 and 0 < y < H - 1:
+                                g[y][x] = "+" if abs(dx) == abs(dy) else ("-" if dy else "|")
+        for px, py, kind in self.powerups:
+            g[py][px] = f"\x1b[1;33m{kind}\x1b[0m"
+        for b in self.bullets:
+            if 0 < b.x < W - 1 and 0 < b.y < H - 1:
+                color = "36" if b.owner == me.id else "31"
+                g[b.y][b.x] = f"\x1b[{color}m{self._bullet_char(b.dx, b.dy)}\x1b[0m"
+        for t in self.tanks.values():
+            if t.alive:
+                if t.clone:
+                    cx, cy = t.clone
+                    g[cy][cx] = f"\x1b[2m{t.char}\x1b[0m"
+                g[t.y][t.x] = f"\x1b[1;32m{t.char}\x1b[0m" if t is me else t.char
+        rows = ["".join(r) for r in g]
+
+        hearts = "\u2665" * max(me.lives, 0) or "-"
+        if me.alive:
+            status = "SHIELD UP" if me.shielded(now) else "Fighting"
+            if me.powerup:
+                status += f" | {POWERUPS[me.powerup]} {max(0, me.powerup_until - now):.0f}s"
+        elif me.lives <= 0:
+            status = f"GAME OVER - rejoining in {max(0, me.respawn_at - now):.0f}s"
+        else:
+            status = f"Destroyed! Respawn in {max(0, me.respawn_at - now):.0f}s"
+        top = sorted(self.tanks.values(), key=lambda t: (-t.kills, t.deaths, t.id))[:3]
+        board = "  ".join(f"{i + 1}.{t.name} {t.kills}" for i, t in enumerate(top))
+        rows.append(f"Lives: {hearts} | Kills: {me.kills} | Players: {len(self.tanks)} | {status}\x1b[K")
+        rows.append(f"Top: {board}\x1b[K")
+        rows.append("Arrows/WASD move  Space shoot  Q quit | "
+                    "T=triple R=rapid P=pierce M=twin S=speed\x1b[K")
+        return rows
 
 
-def bullet_char(dx, dy):
-    if dx and dy:
-        return "\\" if dx == dy else "/"
-    return "|" if dy else "-"
+# --------------------------------------------------------------------------- network
+def sanitize_name(raw: Optional[str], fallback: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]", "", raw or "")[:12]
+    return name or fallback
 
 
-def render_for(me):
-    now = time.time()
-    g = [[" "] * W for _ in range(H)]
-    for x in range(W):
-        g[0][x] = g[H - 1][x] = "#"
-    for y in range(H):
-        g[y][0] = g[y][W - 1] = "#"
-    for t in tanks.values():             # shield boxes
-        if t.shielded:
-            for dx in range(-1, 2):
-                for dy in range(-1, 2):
-                    if max(abs(dx), abs(dy)) == 1:
-                        x, y = t.x + dx, t.y + dy
-                        if 0 < x < W - 1 and 0 < y < H - 1:
-                            g[y][x] = ("+" if abs(dx) == abs(dy) else
-                                       "-" if dy else "|")
-    for px, py, kind in powerups:
-        g[py][px] = f"\x1b[1;33m{kind}\x1b[0m"
-    for bx, by, bdx, bdy, *_ in bullets:
-        if 0 < bx < W - 1 and 0 < by < H - 1:
-            g[by][bx] = bullet_char(bdx, bdy)
-    for t in tanks.values():
-        if t.alive:
-            if t.clone:
-                cx, cy = t.clone
-                g[cy][cx] = f"\x1b[2m{t.char}\x1b[0m"
-            g[t.y][t.x] = (f"\x1b[1;32m{t.char}\x1b[0m" if t is me else t.char)
-    lines = ["".join(r) for r in g]
-    hearts = "\u2665" * max(me.lives, 0) or "-"
-    if me.alive:
-        status = "SHIELD UP" if me.shielded else "Fighting"
-    elif me.lives <= 0:
-        status = f"GAME OVER - rejoining in {max(0, me.respawn_at - now):.0f}s"
-    else:
-        status = f"Destroyed! Respawn in {max(0, me.respawn_at - now):.0f}s"
-    if me.powerup and me.alive:
-        status += f" | {POWERUPS[me.powerup]} {max(0, me.powerup_until - now):.0f}s"
-    lines.append(f"\x1b[2KLives: {hearts} | Kills: {me.kills} | Players: {len(tanks)} | {status}")
-    lines.append("\x1b[2KArrows: move  Space: shoot  Q: quit   "
-                 "Power-ups: T=triple R=rapid P=pierce M=twin S=speed")
-    return "\x1b[H" + "\r\n".join(lines)
+class Session:
+    """One player's connection: reads keys, writes only the screen rows that changed."""
 
+    def __init__(self, process, tank: Tank, cfg: Config):
+        self.process, self.tank, self.cfg = process, tank, cfg
+        self.out = process.stdout
+        self.parser = KeyParser()
+        self.last_rows: Optional[List[str]] = None
+        self.warned = False
+        self.size_ok = True
+        self.closed = False
+        self.update_size()
 
-async def game_loop():
-    while True:
-        step_game()
-        for t in list(tanks.values()):
+    def update_size(self) -> None:
+        try:
+            cols, rows = self.process.get_terminal_size()[:2]
+        except Exception:
+            cols = rows = 0
+        self.cols, self.rows = cols, rows
+        self.size_ok = cols == 0 or (cols >= self.cfg.width and rows >= self.cfg.height + HUD_ROWS)
+        self.last_rows, self.warned = None, False
+
+    def write(self, s: str) -> None:
+        if self.closed:
+            return
+        try:
+            self.out.write(s)
+        except Exception:
+            self.closed = True
+
+    def backlog(self) -> int:
+        try:
+            return self.out.channel.get_write_buffer_size()
+        except Exception:
+            return 0
+
+    def send(self, rows: List[str]) -> None:
+        if not self.size_ok:
+            if not self.warned:
+                self.warned = True
+                self.write(f"\x1b[2J\x1b[HTerminal too small: need {self.cfg.width}x"
+                           f"{self.cfg.height + HUD_ROWS}, have {self.cols}x{self.rows}. Resize the window.")
+            return
+        if self.backlog() > BACKLOG_LIMIT:           # slow client: drop frame, never queue
+            self.last_rows = None
+            return
+        parts = ["\x1b[2J"] if self.last_rows is None else []
+        for i, row in enumerate(rows):
+            if self.last_rows is None or self.last_rows[i] != row:
+                parts.append(f"\x1b[{i + 1};1H{row}")
+        if parts:
+            self.write("".join(parts))
+        self.last_rows = rows
+
+    async def read_loop(self, game: Game) -> None:
+        while not self.closed:
             try:
-                t.out.write(render_for(t))
+                data = await asyncio.wait_for(self.process.stdin.read(256), self.cfg.idle_timeout)
+            except TerminalSizeChanged:
+                self.update_size()
+                continue
+            except asyncio.TimeoutError:
+                self.write("\x1b[2J\x1b[HDisconnected: idle too long.\r\n")
+                return
+            if not data:
+                return
+            for key in self.parser.feed(data):
+                if key == "QUIT":
+                    return
+                game.push_input(self.tank, key)
+
+
+class TankServer:
+    def __init__(self, cfg: Config, game: Optional[Game] = None):
+        self.cfg = cfg
+        self.game = game or Game(cfg)
+        self.sessions: Dict[int, Session] = {}
+        self.ip_counts: Counter = Counter()
+
+    # connection admission (called from SSHServer.connection_made)
+    def admit(self, ip: str) -> bool:
+        if self.ip_counts[ip] >= self.cfg.max_per_ip:
+            log.warning("rejecting %s: too many connections", ip)
+            return False
+        self.ip_counts[ip] += 1
+        return True
+
+    def release(self, ip: str) -> None:
+        self.ip_counts[ip] -= 1
+        if self.ip_counts[ip] <= 0:
+            del self.ip_counts[ip]
+
+    async def handle(self, process) -> None:
+        peer = process.get_extra_info("peername")
+        ip = peer[0] if peer else "?"
+        if process.get_terminal_type() is None:
+            process.stdout.write("This game needs a terminal. Connect with: ssh -t -p "
+                                 f"{self.cfg.port} <host>\r\n")
+            process.exit(1)
+            return
+        if len(self.sessions) >= self.cfg.max_players:
+            process.stdout.write("Server full, try again soon.\r\n")
+            process.exit(1)
+            return
+        tank = self.game.add_player("")
+        tank.name = sanitize_name(process.get_extra_info("username"), f"tank{tank.id}")
+        sess = Session(process, tank, self.cfg)
+        self.sessions[tank.id] = sess
+        log.info("join: %s from %s (%d online)", tank.name, ip, len(self.sessions))
+        sess.write(ENTER)
+        try:
+            await sess.read_loop(self.game)
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        except Exception:
+            log.exception("session error for %s", tank.name)
+        finally:
+            sess.closed = True
+            self.sessions.pop(tank.id, None)
+            self.game.remove_player(tank)
+            log.info("leave: %s (kills=%d deaths=%d dropped_inputs=%d)",
+                     tank.name, tank.kills, tank.deaths, tank.dropped)
+            try:
+                process.stdout.write(LEAVE + "Thanks for playing!\r\n")
+                process.exit(0)
             except Exception:
                 pass
-        await asyncio.sleep(TICK)
+
+    def broadcast(self) -> None:
+        now = self.game.clock()
+        for s in list(self.sessions.values()):
+            s.send(self.game.render(s.tank, now))
+
+    async def game_loop(self) -> None:
+        """Fixed timestep with drift correction; resyncs instead of spiralling if overloaded."""
+        step = self.cfg.tick
+        next_t = time.monotonic()
+        while True:
+            self.game.tick()
+            self.broadcast()
+            next_t += step
+            delay = next_t - time.monotonic()
+            if delay < -1.0:
+                log.warning("server overloaded, skipping %.1fs", -delay)
+                next_t = time.monotonic()
+                delay = 0
+            await asyncio.sleep(max(0.0, delay))
 
 
-KEY_RE = re.compile(r"\x1b\[([ABCD])|\x1bO([ABCD])|(.)", re.S)
-ARROWS = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
+if asyncssh:
+    class GameSSHServer(asyncssh.SSHServer):
+        def __init__(self, mgr: TankServer):
+            self.mgr, self.ip, self.admitted = mgr, "?", False
+
+        def connection_made(self, conn):
+            peer = conn.get_extra_info("peername")
+            self.ip = peer[0] if peer else "?"
+            self.admitted = self.mgr.admit(self.ip)
+            if not self.admitted:
+                conn.abort()
+
+        def connection_lost(self, exc):
+            if self.admitted:
+                self.mgr.release(self.ip)
+
+        def begin_auth(self, username):
+            return bool(self.mgr.cfg.password)       # False -> no auth required
+
+        def password_auth_supported(self):
+            return bool(self.mgr.cfg.password)
+
+        def validate_password(self, username, password):
+            return hmac.compare_digest(password.encode(), self.mgr.cfg.password.encode())
 
 
-async def handle_client(process):
-    global next_id
-    next_id += 1
-    t = Tank(next_id, process.stdout)
-    tanks[t.id] = t
-    process.stdout.write("\x1b[2J\x1b[?25l")        # clear, hide cursor
-    try:
-        quit_ = False
-        while not quit_:
-            data = await process.stdin.read(64)
-            if not data:
-                break
-            for m in KEY_RE.finditer(data):
-                arrow = m.group(1) or m.group(2)
-                key = ARROWS[arrow] if arrow else m.group(3)
-                if key in ("q", "Q", "\x03", "\x04"):
-                    quit_ = True
-                    break
-                handle_key(t, key)
-    except (asyncssh.TerminalSizeChanged, ConnectionError):
-        pass
-    finally:
-        tanks.pop(t.id, None)
+def ensure_host_key(path: str) -> str:
+    if not os.path.exists(path):
+        key = asyncssh.generate_private_key("ssh-ed25519")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(key.export_private_key())
+        log.info("generated host key %s", path)
+    return path
+
+
+async def serve(cfg: Config) -> None:
+    mgr = TankServer(cfg)
+    server = await asyncssh.create_server(
+        lambda: GameSSHServer(mgr), cfg.host, cfg.port,
+        server_host_keys=[ensure_host_key(cfg.host_key)],
+        process_factory=mgr.handle,
+        line_editor=False, encoding="utf-8", errors="replace",
+        login_timeout=20, keepalive_interval=15, keepalive_count_max=3,
+        compression_algs=None, reuse_address=True)
+    log.info("tanks listening on port %d (auth: %s)", cfg.port,
+             "password" if cfg.password else "open")
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            process.stdout.write("\x1b[?25h\x1b[2J\x1b[HThanks for playing!\r\n")
-            process.exit(0)
-        except Exception:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:                  # Windows
             pass
+    task = asyncio.create_task(mgr.game_loop())
+    try:
+        await stop.wait()
+    finally:
+        task.cancel()
+        server.close()
+        await server.wait_closed()
+        log.info("shut down")
 
 
-class OpenServer(asyncssh.SSHServer):
-    def begin_auth(self, username):
-        return False        # no authentication required
-
-
-async def main():
-    if not os.path.exists(HKEY):
-        asyncssh.generate_private_key("ssh-rsa").write_private_key(HKEY)
-    await asyncssh.create_server(
-        OpenServer, "", PORT,
-        server_host_keys=[HKEY],
-        process_factory=handle_client,
-        line_editor=False,          # raw keystrokes
-        encoding="utf-8",
-    )
-    print(f"Tank game listening on port {PORT}")
-    await game_loop()
+def main() -> None:
+    if asyncssh is None:
+        raise SystemExit("asyncssh is required: pip install asyncssh")
+    ap = argparse.ArgumentParser(description="ASCII tanks over SSH")
+    ap.add_argument("--host", default="")
+    ap.add_argument("--port", type=int, default=1111)
+    ap.add_argument("--max-players", type=int, default=30)
+    ap.add_argument("--max-per-ip", type=int, default=4)
+    ap.add_argument("--host-key", default="ssh_host_key")
+    ap.add_argument("--verbose", action="store_true")
+    a = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    cfg = Config(host=a.host, port=a.port, max_players=a.max_players,
+                 max_per_ip=a.max_per_ip, host_key=a.host_key,
+                 password=os.environ.get("TANKS_PASSWORD") or None)
+    try:
+        asyncio.run(serve(cfg))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
