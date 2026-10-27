@@ -5,6 +5,7 @@ ASCII multiplayer tanks over SSH.
 Round flow: the first player in is the admin: picks the map size (small/medium/large) and view (top-down or 2.5D isometric), then edits the map (arrows/WASD move the
 '#' cursor, Space toggles a wall, Enter starts). Others wait in a lobby. After a 3-2-1
 countdown, last player with lives wins, then everyone returns to the map editor.
+Esc quits. 2.5D mode: E rotates the camera, Q toggles straight/lob, hold Space to power a lob.
 
 Architecture
   Game        - pure, deterministic game engine. No I/O, injectable clock and RNG,
@@ -68,6 +69,30 @@ ISO_FACES = {0: (245, 241, 238), 1: (250, 245, 240), 2: (214, 172, 130), 3: (203
 ISO_REMAP = {"UP": "RIGHT", "RIGHT": "UP", "DOWN": "LEFT", "LEFT": "DOWN"}
 ISO_FACE = {(1, 0): "NE", (0, -1): "SE", (-1, 0): "SW", (0, 1): "NW"}
 
+
+def rot(dx: int, dy: int, k: int) -> Tuple[int, int]:
+    """World offset -> camera frame for camera corner k (0=NW, 1=NE, 2=SE, 3=SW; clockwise)."""
+    for _ in range(k % 4):
+        dx, dy = dy, -dx
+    return dx, dy
+
+
+def unrot(rx: int, ry: int, k: int) -> Tuple[int, int]:
+    """Inverse of rot(): camera-frame offset -> world offset."""
+    for _ in range(k % 4):
+        rx, ry = -ry, rx
+    return rx, ry
+
+
+_ISO_SCREEN = {"UP": (1, 0), "RIGHT": (0, -1), "DOWN": (-1, 0), "LEFT": (0, 1)}
+_WORLD_KEY = {(1, 0): "RIGHT", (-1, 0): "LEFT", (0, 1): "DOWN", (0, -1): "UP"}
+
+
+def iso_key(key: str, cam: int) -> str:
+    """Arrow key -> world direction so each key always moves along its screen diagonal."""
+    v = _ISO_SCREEN.get(key)
+    return key if v is None else _WORLD_KEY[unrot(v[0], v[1], cam)]
+
 # 5-row block digits for the full-screen countdown
 BIG = {
     "3": [" ##### ", "     ##", "  #### ", "     ##", " ##### "],
@@ -97,6 +122,15 @@ class Config:
     start_lives: int = 3
     win_display: float = 6            # seconds the winner screen shows
     low_walls_pass: bool = True       # 2.5D mode: height-1 walls block tanks but not bullets
+    lob_cooldown: float = 0.8         # seconds between lob shots
+    lob_first_gap: float = 0.55       # no key-repeat after the first Space -> released (a tap)
+    lob_repeat_gap: float = 0.18      # gap between repeats that counts as "let go"
+    lob_max_charge: float = 1.2       # seconds of holding for a full-power lob
+    lob_min_range: int = 4            # tiles flown by a tap
+    lob_max_range: int = 14           # tiles flown by a full charge
+    lob_launch_h: float = 1.0         # shell leaves the barrel at this height (wall heights)
+    lob_apex_min: float = 2.9         # arc peak at minimum power: clears 1 and 2, never 3
+    lob_apex_max: float = 4.4         # arc peak at full power: clears 3 in the middle of its flight
     powerup_time: float = 10
     powerup_every: float = 8
     powerup_max: int = 3
@@ -157,7 +191,8 @@ class KeyParser:
              "\r": "ENTER", "\n": "ENTER",
              "1": "H1", "2": "H2", "3": "H3", "x": "ERASE", "X": "ERASE",
              "c": "CLEAR", "C": "CLEAR", "v": "PREVIEW", "V": "PREVIEW",
-             "q": "QUIT", "Q": "QUIT", "\x03": "QUIT", "\x04": "QUIT"}
+             "q": "TOGGLE", "Q": "TOGGLE", "e": "ROTATE", "E": "ROTATE",
+             "\x03": "QUIT", "\x04": "QUIT"}      # Esc -> QUIT is handled by Session (lone ESC)
 
     SWIPE_X = 3          # columns of finger travel that count as a horizontal swipe
     SWIPE_Y = 2          # rows of finger travel that count as a vertical swipe
@@ -166,6 +201,11 @@ class KeyParser:
         self.buf = ""
         self.origin: Optional[Tuple[int, int]] = None   # where the current touch started
         self.swiped = False                              # did this touch already steer?
+
+    @property
+    def pending_escape(self) -> bool:
+        """True when the only buffered byte is ESC: either a lone Esc key or a split sequence."""
+        return self.buf == "\x1b"
 
     def _mouse(self, params: str, final: str) -> Optional[str]:
         """SGR mouse report (touch screens send these). Tap -> FIRE, swipe -> direction."""
@@ -252,6 +292,11 @@ class Bullet:
     owner: int
     pierce: bool
     speed: int
+    lob: bool = False          # artillery shell: arcs over walls, explodes where it lands
+    steps: int = 0
+    dist: int = 0
+    apex: float = 0.0
+    launch: float = 1.0
 
 
 @dataclass
@@ -276,6 +321,12 @@ class Tank:
     tokens: float = 0.0
     last_refill: float = 0.0
     dropped: int = 0
+    cam: int = 0                   # 2.5D camera corner: 0=NW 1=NE 2=SE 3=SW (press E, clockwise)
+    lob_mode: bool = False         # 2.5D: Space fires a lob (True) or a straight shot (False)
+    charge_n: int = 0              # Space presses/repeats seen in the current charge
+    charge_first: float = 0.0
+    charge_last: float = 0.0
+    charge_lock: float = 0.0
 
     @property
     def vertical(self) -> bool:
@@ -342,6 +393,7 @@ class Game:
         self.brush = 1                              # wall height the editor places (2.5D)
         self.preview = False                        # editor shows the 2.5D preview
         self._clear_armed = 0.0
+        self.blasts: List[list] = []                # [x, y, expires_at] lob explosions
         self._apply_size(DEFAULT_SIZE)
         self.admin_id: Optional[int] = None
         self.phase_until = 0.0
@@ -387,7 +439,7 @@ class Game:
         self.pick_idx = self.size_idx
         self.pick_view = 0 if self.view == "TOP" else 1
         self.preview, self.brush = False, 1
-        self.bullets, self.powerups = [], []
+        self.bullets, self.powerups, self.blasts = [], [], []
         if clear_walls:
             self._apply_size(DEFAULT_SIZE)
             self.walls.clear()
@@ -406,6 +458,7 @@ class Game:
         for t in self.tanks.values():
             t.lives, t.kills, t.deaths = self.cfg.start_lives, 0, 0
             t.alive, t.clone, t.powerup, t.respawn_at = False, None, None, now
+            t.lob_mode, t.charge_n = False, 0
             t.inbox.clear()
 
     def push_input(self, t: Tank, key: str) -> bool:
@@ -595,8 +648,12 @@ class Game:
                 key = t.inbox.popleft()
                 if t.id != self.admin_id:
                     continue
+                if key == "ROTATE":
+                    if iso and self.preview:
+                        t.cam = (t.cam + 1) % 4
+                    continue
                 if self.preview:                         # preview pans along screen diagonals
-                    key = ISO_REMAP.get(key, key)
+                    key = iso_key(key, t.cam)
                 pos = (self.cursor[0], self.cursor[1])
                 if key in MOVES:
                     dx, dy = MOVES[key]
@@ -633,14 +690,24 @@ class Game:
             while t.inbox:
                 key = t.inbox.popleft()
                 if self.view == "ISO":
-                    key = ISO_REMAP.get(key, key)
+                    key = iso_key(key, t.cam)
+                    if key == "ROTATE":
+                        t.cam = (t.cam + 1) % 4
+                        continue
+                    if key == "TOGGLE":
+                        t.lob_mode = not t.lob_mode
+                        t.charge_n = 0
+                        continue
                 if key == "ENTER" and t.id == self.admin_id and self.round_size < 2:
                     self._enter_edit()               # solo round: admin ends it
                     return
                 if not t.alive:
                     continue
                 if key == "FIRE":
-                    self._fire(t, now)
+                    if self.view == "ISO" and t.lob_mode:
+                        self._charge(t, now)
+                    else:
+                        self._fire(t, now)
                 elif key in MOVES:
                     self._move(t, key)
         for t in self.tanks.values():
@@ -655,6 +722,8 @@ class Game:
                     if (p[0], p[1]) == (t.x, t.y):
                         self.powerups.remove(p)
                         self._give_powerup(t, p[2], now)
+        for t in self.tanks.values():
+            self._release_lob(t, now)
         if now >= self._next_powerup:
             self._next_powerup = now + cfg.powerup_every
             if self.tanks and len(self.powerups) < cfg.powerup_max:
@@ -665,7 +734,12 @@ class Game:
                         self.powerups.append([x, y, self.rng.choice(list(POWERUPS))])
                         break
         survivors = []
+        self.blasts = [e for e in self.blasts if e[2] > now]
         for b in self.bullets:
+            if b.lob:
+                if self._step_lob(b, now):
+                    survivors.append(b)
+                continue
             dead = False
             for _ in range(b.speed):
                 if (not self.in_bounds(b.x, b.y) or self._blocks_bullet(b.x, b.y)
@@ -682,6 +756,78 @@ class Game:
             if len(alive) <= 1:
                 self.winner = alive[0].name if alive else ""
                 self.phase, self.phase_until = "WIN", now + cfg.win_display
+
+    # ---- lob shots (2.5D only). Terminals send no key-release events, so "holding Space"
+    # is detected from the OS key-repeat: the charge runs from the first Space to the last
+    # repeat, and the shell is released once the repeats stop.
+    def _charge(self, t: Tank, now: float) -> None:
+        if not t.alive:
+            return
+        if now < t.charge_lock:                      # still holding after an auto-fired max charge
+            t.charge_lock = now + self.cfg.lob_repeat_gap * 1.5
+            return
+        if t.charge_n == 0:
+            t.charge_first = now
+        t.charge_n += 1
+        t.charge_last = now
+
+    def _release_lob(self, t: Tank, now: float) -> None:
+        if t.charge_n == 0:
+            return
+        if not t.alive:
+            t.charge_n = 0
+            return
+        cfg = self.cfg
+        held = t.charge_last - t.charge_first
+        limit = cfg.lob_first_gap if t.charge_n == 1 else cfg.lob_repeat_gap
+        capped = held >= cfg.lob_max_charge
+        if now - t.charge_last < limit and not capped:
+            return
+        t.charge_n = 0
+        if capped:
+            t.charge_lock = now + cfg.lob_repeat_gap * 1.5
+        if now - t.last_shot < cfg.lob_cooldown:
+            return
+        t.last_shot = now
+        frac = min(1.0, held / cfg.lob_max_charge)
+        dist = cfg.lob_min_range + round(frac * (cfg.lob_max_range - cfg.lob_min_range))
+        apex = cfg.lob_apex_min + frac ** 3 * (cfg.lob_apex_max - cfg.lob_apex_min)   # height ramps up late
+        self.bullets.append(Bullet(t.x, t.y, t.dx, t.dy, t.id, False, 1, True, 0, dist, apex,
+                                   cfg.lob_launch_h))
+
+    @staticmethod
+    def lob_height(b: Bullet, i: Optional[int] = None) -> float:
+        i = b.steps if i is None else i
+        u = i / b.dist
+        h0 = b.launch
+        return h0 + (b.apex - h0) * 4 * u * (1 - u)
+
+    def _step_lob(self, b: Bullet, now: float) -> bool:
+        """Advance a shell one tile. It clears a wall only if its arc is higher than the wall."""
+        i = b.steps + 1
+        nx, ny = b.x + b.dx, b.y + b.dy
+        if not self.in_bounds(nx, ny):
+            self._explode(b.x, b.y, b, now)
+            return False
+        if i >= b.dist:                              # landed
+            self._explode(nx, ny, b, now)
+            return False
+        wall = self.walls.get((nx, ny), 0)
+        if wall and self.lob_height(b, i) <= wall:   # too low: smacks into the wall
+            self._explode(b.x, b.y, b, now)
+            return False
+        b.x, b.y, b.steps = nx, ny, i
+        return True
+
+    def _explode(self, x: int, y: int, b: Bullet, now: float) -> None:
+        """3x3 blast. Shields absorb it; a twin tank absorbs one hit; the shooter is safe."""
+        self.blasts.append([x, y, now + 0.35])
+        for t in list(self.tanks.values()):
+            if not t.alive or t.id == b.owner:
+                continue
+            near = cheb(t.x, t.y, x, y) <= 1 or (t.clone and cheb(t.clone[0], t.clone[1], x, y) <= 1)
+            if near and not t.shielded(now):
+                self._damage(t, b.owner, now)
 
     def _blocks_bullet(self, x: int, y: int) -> bool:
         h = self.walls.get((x, y), 0)
@@ -722,7 +868,8 @@ class Game:
             n = min(3, int(max(0.0, self.phase_until - now)) + 1)
             art = [("".join(c * 3 for c in row)) for row in BIG[str(n)] for _ in (0, 1)]
             return self._screen(["GET READY", ""] + art + ["", "Arrows/WASD or swipe to move  Space or tap to shoot"]
-                                 + (["2.5D view: each arrow moves along its screen diagonal"]
+                                 + (["2.5D: each arrow moves along its screen diagonal",
+                                     "Q lob/straight   E rotate camera   hold Space = longer lob"]
                                     if self.view == "ISO" else []))
         if self.phase == "WIN":
             who = self.winner or "Nobody - it's a draw"
@@ -741,7 +888,7 @@ class Game:
             for t in list(self.tanks.values())[:12]:
                 tag = " (admin)" if t.id == self.admin_id else (" (you)" if t is me else "")
                 lines.append("- " + t.name + tag)
-            lines += ["", "The game starts when the admin presses Enter.  Q quit"]
+            lines += ["", "The game starts when the admin presses Enter.  Esc quit"]
             return self._screen(lines)
         if self.phase == "SIZE":                     # admin: size picker
             lines = ["=== CHOOSE MAP SIZE ===", "",
@@ -752,7 +899,7 @@ class Game:
             _, pw, ph = SIZES[self.pick_idx]
             lines += ["", "+" + "-" * (pw // 3) + "+"]
             lines += ["|" + " " * (pw // 3) + "|" for _ in range(ph // 3)]
-            lines += ["+" + "-" * (pw // 3) + "+", "", f"Players: {len(self.tanks)}   Q quit"]
+            lines += ["+" + "-" * (pw // 3) + "+", "", f"Players: {len(self.tanks)}   Esc quit"]
             return self._screen(lines)
         if self.phase == "VIEW":                     # admin: view-mode picker
             lines = ["=== CHOOSE VIEW MODE ===", "",
@@ -767,11 +914,11 @@ class Game:
             lines += [""] + [r.ljust(w) for r in art]
             if self.pick_view == 1:
                 lines += ["", "Wall heights:  # = 1 (low)   $ = 2   @ = 3"]
-            lines += ["", f"Players: {len(self.tanks)}   Q quit"]
+            lines += ["", f"Players: {len(self.tanks)}   Esc quit"]
             return self._screen(lines)
         iso = self.view == "ISO"
         if iso and self.preview:
-            rows = self._iso_canvas(me, now, (self.cursor[0], self.cursor[1]), cursor=True).rows()
+            rows = self._iso_canvas(me, now, (self.cursor[0], self.cursor[1]), cursor=True, cam=me.cam).rows()
             return rows + self._edit_hud(now)
         g = self._grid()
         cx, cy = self.cursor
@@ -785,7 +932,7 @@ class Game:
         if self.view != "ISO":
             return [f"MAP EDITOR - you are the admin | Walls: {len(self.walls)}\x1b[K",
                     "Arrows/WASD/swipe move | Space/tap wall | Enter start\x1b[K",
-                    plist, "Q quit\x1b[K"]
+                    plist, "Esc quit\x1b[K"]
         brush = " ".join(f"\x1b[1;{WALL_COL[h]};7m{h}:{WALL_CH[h]}\x1b[0m" if h == self.brush
                          else f"{h}:{WALL_CH[h]}" for h in (1, 2, 3))
         title = "2.5D PREVIEW" if self.preview else "MAP EDITOR 2.5D"
@@ -796,7 +943,7 @@ class Game:
         else:
             l2 = "Arrows/WASD move  Space place  X erase  C,C clear all"
         return [f"{title} | Walls: {len(self.walls)} | Brush: {brush}\x1b[K", l2 + "\x1b[K", plist,
-                "1/2/3 height  V 2.5D preview  Enter start  Q quit\x1b[K"]
+                "1/2/3 height  V preview  E rotate (preview)  Enter start  Esc quit\x1b[K"]
 
     def _render_play(self, me: Tank, now: float) -> List[str]:
         rows = self._iso_rows(me, now) if self.view == "ISO" else self._topdown_rows(me, now)
@@ -804,9 +951,9 @@ class Game:
 
     # ---- 2.5D isometric renderer
     @staticmethod
-    def _iso_xy(x: int, y: int, tx: int, ty: int) -> Tuple[int, int]:
+    def _iso_xy(x: int, y: int, tx: int, ty: int, cam: int = 0) -> Tuple[int, int]:
         """Screen (col,row) of a tile's top-left cell. Camera over corner (0,0)."""
-        dx, dy = x - tx, y - ty
+        dx, dy = rot(x - tx, y - ty, cam)
         return MAX_W // 2 - 2 + 2 * (dx - dy), MAX_H // 2 - 1 - (dx + dy)
 
     @staticmethod
@@ -823,10 +970,11 @@ class Game:
                 cv.put(sx + 2 + c, r, " ", f"48;5;{right}")
 
     @staticmethod
-    def _iso_tank(cv: Canvas, sx: int, sy: int, t: Tank, mine: bool, clone: bool, now: float) -> None:
+    def _iso_tank(cv: Canvas, sx: int, sy: int, t: Tank, mine: bool, clone: bool, now: float,
+                  cam: int = 0) -> None:
         """Tank sprite: 4x2 hull + turret with the barrel pointing along its facing."""
         r0, r1 = list(" () "), list("[==]")
-        face = ISO_FACE.get((t.dx, t.dy), "NE")
+        face = ISO_FACE.get(rot(t.dx, t.dy, cam), "NE")
         if face == "NE":
             r0[3] = "/"
         elif face == "NW":
@@ -842,7 +990,7 @@ class Game:
             cv.put(sx + i, sy + 1, r1[i], style)
 
     def _iso_canvas(self, me: Optional[Tank], now: float, target: Tuple[int, int],
-                    cursor: bool = False) -> Canvas:
+                    cursor: bool = False, cam: int = 0) -> Canvas:
         cv = Canvas(MAX_W, MAX_H)
         W, H = self.cfg.width, self.cfg.height
         tx, ty = target
@@ -853,14 +1001,16 @@ class Game:
                 if t.clone:
                     ents.setdefault(t.clone, []).append(("T", t, True))
         for b in self.bullets:
-            ents.setdefault((b.x, b.y), []).append(("B", b, False))
+            if not b.lob:
+                ents.setdefault((b.x, b.y), []).append(("B", b, False))
         for p in self.powerups:
             ents.setdefault((p[0], p[1]), []).append(("P", p, False))
         for s in range(14, -15, -1):                 # far tiles first (painter's algorithm)
             for d in range(-17, 18):
                 if (s + d) % 2:
                     continue
-                x, y = tx + (s + d) // 2, ty + (s - d) // 2
+                wx, wy = unrot((s + d) // 2, (s - d) // 2, cam)
+                x, y = tx + wx, ty + wy
                 if not (0 <= x < W and 0 <= y < H):
                     continue
                 sx, sy = MAX_W // 2 - 2 + 2 * d, MAX_H // 2 - 1 - s
@@ -875,23 +1025,35 @@ class Game:
                     if kind == "T":
                         if obj is me and not clone:
                             continue                 # own tank is drawn last, always visible
-                        self._iso_tank(cv, sx, sy, obj, obj is me, clone, now)
+                        self._iso_tank(cv, sx, sy, obj, obj is me, clone, now, cam)
                     elif kind == "B":
                         cv.put(sx + 1, sy, "*", "1;36" if (me and obj.owner == me.id) else "1;31")
                     else:
                         cv.put(sx, sy, "<", "33")
                         cv.put(sx + 1, sy, obj[2], "1;33")
                         cv.put(sx + 2, sy, ">", "33")
+        for b in self.bullets:                       # lob shells fly above everything else
+            if b.lob:
+                sx, sy = self._iso_xy(b.x, b.y, tx, ty, cam)
+                lift = int(round(self.lob_height(b)))
+                cv.put(sx + 1, sy, "\u00b7", "1;30")                       # ground shadow
+                cv.put(sx + 1, sy - lift - 1, "O", "1;96" if (me and b.owner == me.id) else "1;91")
+        for bx, by, _ in self.blasts:
+            for ox in (-1, 0, 1):
+                for oy in (-1, 0, 1):
+                    if self.in_bounds(bx + ox, by + oy):
+                        sx, sy = self._iso_xy(bx + ox, by + oy, tx, ty, cam)
+                        cv.put(sx + 1, sy, "*", "1;93")
         if cursor:                                   # editor preview: floating brush marker
-            sx, sy = self._iso_xy(self.cursor[0], self.cursor[1], tx, ty)
+            sx, sy = self._iso_xy(self.cursor[0], self.cursor[1], tx, ty, cam)
             top = sy - self.brush
             for r in (0, 1):
                 for c in range(4):
                     ch = ("[" if c == 0 else "]" if c == 3 else WALL_CH[self.brush]) if r == 0 else " "
                     cv.put(sx + c, top + r, ch, "48;5;226;38;5;16;1")
         elif me is not None and me.alive:            # x-ray: own tank shows through walls
-            sx, sy = self._iso_xy(me.x, me.y, tx, ty)
-            self._iso_tank(cv, sx, sy, me, True, False, now)
+            sx, sy = self._iso_xy(me.x, me.y, tx, ty, cam)
+            self._iso_tank(cv, sx, sy, me, True, False, now, cam)
         return cv
 
     def _iso_rows(self, me: Tank, now: float) -> List[str]:
@@ -901,7 +1063,7 @@ class Game:
             alive = [t for t in self.tanks.values() if t.alive]
             target = ((alive[0].x, alive[0].y) if alive
                       else (self.cfg.width // 2, self.cfg.height // 2))
-        return self._iso_canvas(me, now, target).rows()
+        return self._iso_canvas(me, now, target, cam=me.cam).rows()
 
     def _topdown_rows(self, me: Tank, now: float) -> List[str]:
         W, H = self.cfg.width, self.cfg.height
@@ -944,9 +1106,23 @@ class Game:
         rows.append(f"Lives: {hearts} | Kills: {me.kills} | Players: {len(self.tanks)} | {status}\x1b[K")
         rows.append(f"Top: {board}\x1b[K")
         solo = " | Enter: back to editor" if (me.id == self.admin_id and self.round_size < 2) else ""
-        rows.append("Arrows/WASD/swipe move  Space/tap shoot  Q quit | "
-                    f"T=triple R=rapid P=pierce M=twin S=speed{solo}\x1b[K")
-        rows.append(f"Invite friends: {connect_hint(self.cfg)}\x1b[K")
+        if self.view == "ISO":
+            mode = "LOB" if me.lob_mode else "STRAIGHT"
+            rows.append(f"WASD move  Space shoot (hold = lob power)  Q mode:{mode}  E rotate  Esc quit"
+                        f" | T R P M S{solo}\x1b[K")
+            if me.charge_n and me.alive:
+                cfg = self.cfg
+                frac = min(1.0, (me.charge_last - me.charge_first) / cfg.lob_max_charge)
+                n = int(round(frac * 10))
+                tiles = cfg.lob_min_range + round(frac * (cfg.lob_max_range - cfg.lob_min_range))
+                bar = "#" * n + " " * (10 - n)
+                rows.append(f"Lob power [{bar}] ~{tiles} tiles - release Space to fire\x1b[K")
+            else:
+                rows.append(f"Invite friends: {connect_hint(self.cfg)}\x1b[K")
+        else:
+            rows.append("Arrows/WASD/swipe move  Space/tap shoot  Esc quit | "
+                        f"T=triple R=rapid P=pierce M=twin S=speed{solo}\x1b[K")
+            rows.append(f"Invite friends: {connect_hint(self.cfg)}\x1b[K")
         return rows
 
 
@@ -1013,12 +1189,17 @@ class Session:
 
     async def read_loop(self, game: Game) -> None:
         while not self.closed:
+            esc = self.parser.pending_escape
             try:
-                data = await asyncio.wait_for(self.process.stdin.read(256), self.cfg.idle_timeout)
+                data = await asyncio.wait_for(self.process.stdin.read(256),
+                                              0.08 if esc else self.cfg.idle_timeout)
             except TerminalSizeChanged:
                 self.update_size()
                 continue
             except asyncio.TimeoutError:
+                if esc:                              # nothing followed the ESC: it was the Esc key
+                    self.parser.buf = ""
+                    return
                 self.write("\x1b[2J\x1b[HDisconnected: idle too long.\r\n")
                 return
             if not data:
